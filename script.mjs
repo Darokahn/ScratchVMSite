@@ -1,0 +1,638 @@
+import { unzipSync } from "https://unpkg.com/fflate/esm/browser.js";
+import * as opcode from "./utils/opcode.js";
+import * as imageDrawing from "./utils/imageDrawing.js";
+
+const SIZERATIO = 1024;
+
+const files = {};
+
+// template for the object representing each game object
+function spriteTemplate() {
+    return {
+        name: "",
+        costumes: [],
+        struct: {
+            x: 0,
+            y: 0,
+            rotation: 0,
+            visible: true,
+            layer: 0,
+            size: 128,
+            rotationStyle: 0,
+            costumeIndex: 0,
+            costumeMax: 0,
+            threadCount: 0,
+            variableCount: 0,
+            id: 0,
+            threads: []
+        },
+    }
+}
+
+// template for the object representing a whole game
+function detailsTemplate() {
+    return {
+        unzippedFile: null,
+        imageBuffer: null,
+        sprites: [],
+        code: [],
+        objectIndex: {}
+    };
+}
+
+function toScaledInt32(x) {
+    // Clamp and convert to 16-bit signed
+    x = (x << 16) >> 16;
+    return x << 16;
+}
+
+function degreesToScaled32(degrees) {
+    degrees %= 360;
+    let scaled = (degrees / 360 * (2 ** 32)) & 0xFFFFFFFF;
+
+    return scaled;
+}
+
+// get the sb3 file from the operation layer
+function getFsEntry(name) {
+    return files[name];
+}
+
+// extract relevant details from the sb3 file and load them into a details template
+async function getDetails(project) {
+    let details = detailsTemplate();
+    details.unzippedFile = project;
+    let projectJson = JSON.parse(new TextDecoder("utf-8").decode(project["project.json"])); // I hate javascript
+    for (let [index, target] of projectJson.targets.entries()) {
+        let key = target.name;
+        let sprite = spriteTemplate();
+        sprite.name = target.name
+        sprite.costumes = target.costumes;
+        sprite.struct.id = index;
+        sprite.struct.variableCount = Object.entries(target.variables).length;
+        sprite.struct.x = target.x;
+        sprite.struct.y = target.y;
+        sprite.struct.size = target.size;
+        sprite.struct.rotation = target.direction;
+        sprite.struct.visible = target.visible;
+        sprite.struct.costumeIndex = target.currentCostume;
+        sprite.struct.costumeMax = target.costumes.length;
+        sprite.struct.rotationStyle = target.rotationStyle;
+        adjustSprite(sprite, target.isStage);
+        details.sprites.push(sprite);
+    }
+    details.objectIndex = opcode.indexObjects(projectJson);
+    details.code = compileSprites(details.sprites, projectJson);
+    details.imageBuffer = await imageDrawing.getImageBuffer(project, details);
+    return details;
+}
+
+// Initialize the threads with every block 
+function indexThreads(blocks) {
+    let ids = [];
+    for (let [id, block] of Object.entries(blocks)) {
+        if (block.topLevel && opcode.events.includes(block.opcode)) {
+            ids.push(id);
+        }
+    }
+    return ids;
+}
+
+function compileSprite(code, sprite, blocks, project) {
+    opcode.processBlocks(blocks);
+    let threadIds = indexThreads(blocks);
+    for (let threadId of threadIds) {
+        let hat = blocks[threadId];
+        let thread = opcode.compileBlocks(hat, sprite, blocks, code, project);
+        sprite.struct.threads.push(thread);
+    }
+    sprite.struct.threadCount = sprite.struct.threads.length;
+}
+
+function compileSprites(sprites, projectJson) {
+    let code = [];
+    for (let sprite of sprites) {
+        let blocks = projectJson["targets"][sprite.struct.id]["blocks"]
+        compileSprite(code, sprite, blocks, projectJson);
+    }
+    return code;
+}
+
+// adjust the sprite's parameters to match the quirks of my C representation
+function adjustSprite(sprite, isStage) {
+    if (isStage) {
+        sprite.struct.visible = true;
+    }
+    sprite.struct.x = toScaledInt32(sprite.struct.x);
+    sprite.struct.y = toScaledInt32(sprite.struct.y);
+    sprite.struct.rotation = degreesToScaled32(sprite.struct.rotation);
+    sprite.struct.rotationStyle = ["left-right", "don't rotate", "all around"].indexOf(sprite.struct.rotationStyle);
+    sprite.struct.size = Number(+sprite.struct.size / 100 * SIZERATIO || 0);
+}
+
+function bytesToCarray(bytes, name) {
+    console.log(bytes);
+    return ["const unsigned char ", name, "[] = {", bytes.join(", "), "};"].join("");
+}
+
+function pad(array, align) {
+    while ((array.length % align) !== 0) {
+        array.push(0);
+    }
+}
+
+async function convertScratchProject() {
+    const file = getFsEntry("project");
+    let details = await getDetails(file);
+    let bytes = await getProgramAsBlob(details);
+    sendFile(bytes, "webConverter/uploads/programData.bin");
+    sendFile(bytesToCarray(bytes, "programData"), "webConverter/uploads/definitions.c");
+}
+
+async function sendFile(name, blob) {
+    fetch("upload/" + name, {
+        method: 'POST',
+        headers: {},
+        body: blob
+    });
+}
+
+// assume little endian and no padding
+function toIntStruct(arr, sizes) {
+    if (arr.length !== sizes.length) {
+        console.error("toIntStruct: lengths don't match");
+        return;
+    }
+    let length = 0;
+    for (let size of sizes) {
+        length += size;
+    }
+    let intStruct = [];
+    let index = 0;
+    for (let i = 0; i < arr.length; i++) {
+        let intVal = arr[i];
+        let size = sizes[i];
+        for (let j = 0; j < size; j++) {
+            intStruct[index] = (intVal >> (j * 8)) & 0xff;
+            index += 1;
+        }
+    }
+    return intStruct;
+}
+
+function makeSprite(spriteBase) {
+    let sizes = [
+        4, 4, 4,
+        2,
+        1, 1, 1, 1, 1, 1, 1, 1
+    ];
+    return toIntStruct(
+        [
+            spriteBase.x, spriteBase.y, spriteBase.rotation,
+            spriteBase.size,
+            spriteBase.visible, spriteBase.layer, spriteBase.rotationStyle, spriteBase.costumeIndex,
+            spriteBase.costumeMax, spriteBase.threadCount, spriteBase.variableCount, spriteBase.id
+        ],
+        sizes
+    );
+}
+
+function makeThread(threadBase) {
+    let sizes = [2, 2, 1];
+    return toIntStruct(
+        [threadBase.eventCondition, threadBase.entryPoint, threadBase.startEvent],
+        sizes
+    );
+}
+
+async function getProgramAsBlob(details) {
+    console.log(details.code);
+    let code = opcode.getCodeAsBuffer(details.code);
+    pad(code, 4);
+    let headerArray = [
+        details.sprites.length,
+        code.length,
+        5,
+        Object.keys(details.objectIndex.broadcasts).length,
+        Object.keys(details.objectIndex.backdrops).length,
+        0,
+        0,
+        0,
+        0
+    ];
+    let headerArraySizes = [
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        4,
+        4,
+        4
+    ];
+    // just to get a length
+    let headerStruct = toIntStruct(headerArray, headerArraySizes);
+    pad(headerStruct, 4);
+    let spriteBuffer = [];
+    let threadBuffer = [];
+    details.sprites.forEach(sprite => {
+        spriteBuffer.push(...makeSprite(sprite.struct))
+        pad(spriteBuffer, 4);
+        sprite.struct.threads.forEach( thread => {
+            threadBuffer.push(...makeThread(thread));
+            pad(threadBuffer, 2);
+        });
+    });
+    headerArray[5] = headerStruct.length;
+    headerArray[6] = headerStruct.length + code.length;
+    headerArray[7] = headerStruct.length + code.length + spriteBuffer.length;
+    headerArray[8] = headerStruct.length + code.length + spriteBuffer.length + threadBuffer.length;
+    // for real this time
+    headerStruct = toIntStruct(headerArray, headerArraySizes);
+
+    console.log(headerStruct, code, spriteBuffer, threadBuffer);
+    let imageBytes = details.imageBuffer;
+    let bytes = [...headerStruct, ...code, ...spriteBuffer, ...threadBuffer, ...details.imageBuffer];
+    return bytes;
+}
+
+async function addZipToFs(file, name = "project") {
+    const buffer = file.arrayBuffer;
+    const bytes = new Uint8Array(buffer);
+    const unzipped = unzipSync(bytes);
+    files[name] = unzipped;
+    return unzipped;
+}
+
+// Global variables for ESP32 functionality
+let serialPort = null;
+let serialReader = null;
+
+// Parse project ID from Scratch URL
+function parseProjectIDFromURL(url) {
+    if (!url || !url.trim()) {
+        return null;
+    }
+    
+    // Remove whitespace
+    url = url.trim();
+    
+    // If it's already just a number, return it
+    if (/^\d+$/.test(url)) {
+        return url;
+    }
+    
+    // Try to extract ID from URL patterns:
+    // https://scratch.mit.edu/projects/1238081605/editor/
+    // https://scratch.mit.edu/projects/1238081605
+    // scratch.mit.edu/projects/1238081605
+    const patterns = [
+        /scratch\.mit\.edu\/projects\/(\d+)/i,
+        /\/projects\/(\d+)/i,
+        /projects\/(\d+)/i
+    ];
+    
+    for (const pattern of patterns) {
+        const match = url.match(pattern);
+        if (match && match[1]) {
+            return match[1];
+        }
+    }
+    
+    return null;
+}
+
+// Download Scratch project by URL and store with project name
+async function downloadScratchProject() {
+    try {
+        const projectURLInput = document.getElementById("projectURLInput");
+        
+        if (!projectURLInput) {
+            throw new Error("Input field not found");
+        }
+        
+        const projectURL = projectURLInput.value.trim();
+        
+        if (!projectURL) {
+            updateStatus("Please enter a Scratch project URL or ID", "warning");
+            return;
+        }
+        
+        // Parse project ID from URL
+        const projectID = parseProjectIDFromURL(projectURL);
+        
+        if (!projectID) {
+            updateStatus("Invalid Scratch project URL. Please use format: https://scratch.mit.edu/projects/1238081605", "error");
+            return;
+        }
+        
+        updateStatus(`Downloading Scratch project ${projectID}...`, "info");
+        
+        const options = {
+            onProgress: (type, loaded, total) => {
+                const progress = Math.round((loaded / total) * 100);
+                updateStatus(`Downloading ${type}: ${progress}%`);
+            }
+        };
+        
+        const project = await SBDL.downloadProjectFromID(projectID, options);
+        console.log("Downloaded project:", project);
+        
+        // Get project name from the downloaded project
+        let projectName = project.title;
+        
+        // Fallback to project ID if name not found
+        if (!projectName) {
+            projectName = `project_${projectID}`;
+            updateStatus(`Warning: Could not extract project name, using ${projectName}`, "warning");
+        }
+        
+        // Sanitize project name for filesystem (remove invalid characters)
+        projectName = projectName.replace(/[^a-zA-Z0-9_-]/g, '_').substring(0, 50);
+        
+        await addZipToFs(project, "project");
+        
+        updateStatus(`✓ Project "${projectName}" (ID: ${projectID}) downloaded and stored successfully!`, "success");
+        convertScratchProject();
+        
+        // Clear the input
+        projectURLInput.value = "";
+        
+    } catch (error) {
+        updateStatus(`✗ Error downloading project: ${error.message}`, "error");
+        console.error("Download error:", error);
+    }
+}
+
+// Connect to serial port
+async function connectSerial() {
+    try {
+        // Check if Web Serial API is available
+        if (!("serial" in navigator)) {
+            throw new Error("Web Serial API not supported in this browser");
+        }
+        
+        updateStatus("Requesting serial port access...", "info");
+        
+        // Request port access
+        serialPort = await navigator.serial.requestPort();
+        
+        // Open the port with appropriate baud rate for ESP32
+        await serialPort.open({ baudRate: 115200 });
+        
+        updateStatus("✓ Serial port connected successfully", "success");
+        
+        // Show disconnect button, hide connect button
+        const connectBtn = document.getElementById("connectSerial");
+        const disconnectBtn = document.getElementById("disconnectSerial");
+        if (connectBtn) connectBtn.style.display = "none";
+        if (disconnectBtn) disconnectBtn.style.display = "inline-block";
+        
+        // Set up reader for incoming data (optional, for debugging)
+        const textDecoder = new TextDecoderStream();
+        const readableStreamClosed = serialPort.readable.pipeTo(textDecoder.writable);
+        serialReader = textDecoder.readable.getReader();
+        
+        // Start reading in background (non-blocking)
+        readSerialData();
+        
+    } catch (error) {
+        if (error.name === "NotFoundError") {
+            updateStatus("No serial port selected", "warning");
+        } else {
+            updateStatus(`✗ Error connecting to serial: ${error.message}`, "error");
+        }
+        console.error("Serial connection error:", error);
+        serialPort = null;
+    }
+}
+
+// Read serial data (background task)
+async function readSerialData() {
+    if (!serialReader) return;
+    
+    try {
+        while (true) {
+            const { value, done } = await serialReader.read();
+            if (done) {
+                break;
+            }
+            // Log received data (optional)
+            console.log("Serial RX:", new TextDecoder().decode(value));
+        }
+    } catch (error) {
+        console.error("Serial read error:", error);
+    }
+}
+
+// Reset ESP32 using DTR/RTS signals if available, or send reset command
+async function resetESP32() {
+    try {
+        // Try to use setSignals if available (Web Serial API feature)
+        if (serialPort && 'setSignals' in serialPort) {
+            try {
+                // Toggle DTR to reset ESP32 (DTR low = reset)
+                await serialPort.setSignals({ dataTerminalReady: false });
+                await new Promise(resolve => setTimeout(resolve, 100)); // Hold reset for 100ms
+                await serialPort.setSignals({ dataTerminalReady: true });
+                updateStatus("ESP32 reset via DTR signal", "info");
+                return;
+            } catch (error) {
+                console.warn("setSignals not supported or failed, trying alternative method:", error);
+            }
+        }
+        
+        // Fallback: Send a reset command sequence
+        // Some ESP32 firmwares listen for specific commands
+        const writer = serialPort.writable.getWriter();
+        try {
+            // Send a break or reset sequence
+            // Common ESP32 reset: send Ctrl+C (0x03) or specific reset command
+            const resetCommand = new Uint8Array([0x03]); // Ctrl+C to interrupt
+            await writer.write(resetCommand);
+            await new Promise(resolve => setTimeout(resolve, 100));
+            updateStatus("ESP32 reset via command", "info");
+        } finally {
+            writer.releaseLock();
+        }
+    } catch (error) {
+        console.warn("Reset attempt failed, continuing anyway:", error);
+        updateStatus("Reset attempt failed, continuing...", "warning");
+    }
+}
+
+// Disconnect serial port
+async function disconnectSerial() {
+    try {
+        if (serialReader) {
+            await serialReader.cancel();
+            serialReader = null;
+        }
+        
+        if (serialPort) {
+            await serialPort.close();
+            serialPort = null;
+        }
+        
+        updateStatus("Serial port disconnected", "info");
+        
+        // Show connect button, hide disconnect button
+        const connectBtn = document.getElementById("connectSerial");
+        const disconnectBtn = document.getElementById("disconnectSerial");
+        if (connectBtn) connectBtn.style.display = "inline-block";
+        if (disconnectBtn) disconnectBtn.style.display = "none";
+        
+    } catch (error) {
+        updateStatus(`✗ Error disconnecting: ${error.message}`, "error");
+        console.error("Disconnect error:", error);
+    }
+}
+
+// Send program data via serial
+async function sendProgramDataViaSerial() {
+    try {
+        if (!serialPort) {
+            throw new Error("Serial port not connected. Please connect first.");
+        }
+        
+        // Get the program data from getProgramAsBlob
+        const file = getFsEntry("project");
+        if (!file) {
+            throw new Error("No project loaded. Please load a project first.");
+        }
+        
+        updateStatus("Generating program data...", "info");
+        const details = await getDetails(file);
+        const bytes = await getProgramAsBlob(details);
+        
+        if (!bytes || bytes.length === 0) {
+            throw new Error("No program data to send");
+        }
+        
+        updateStatus(`Sending ${bytes.length} bytes via serial...`, "info");
+        
+        // Reset the ESP32 before sending data
+        updateStatus("Resetting ESP32...", "info");
+        await resetESP32();
+        
+        // Wait a bit for ESP32 to boot after reset
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        
+        // Convert bytes array to Uint8Array
+        const dataToSend = new Uint8Array(bytes);
+        
+        // Create size header (4 bytes, little-endian, 32-bit integer)
+        const sizeHeader = new Uint8Array(4);
+        const dataSize = dataToSend.length;
+        sizeHeader[0] = dataSize & 0xFF;
+        sizeHeader[1] = (dataSize >> 8) & 0xFF;
+        sizeHeader[2] = (dataSize >> 16) & 0xFF;
+        sizeHeader[3] = (dataSize >> 24) & 0xFF;
+        
+        // Get the writable stream
+        const writer = serialPort.writable.getWriter();
+        
+        try {
+            // First, send the 4-byte size header
+            updateStatus("Sending size header...", "info");
+            await writer.write(sizeHeader);
+            
+            // Then send the data blob in chunks to avoid overwhelming the buffer
+            const chunkSize = 64; // Common USB serial buffer size
+            let offset = 0;
+            const totalSize = sizeHeader.length + dataToSend.length;
+            
+            while (offset < dataToSend.length) {
+                const chunk = dataToSend.slice(offset, offset + chunkSize);
+                await writer.write(chunk);
+                offset += chunkSize;
+                
+                // Update progress (including header in total)
+                const progress = Math.round(((sizeHeader.length + offset) / totalSize) * 100);
+                updateStatus(`Sending data: ${progress}% (${sizeHeader.length + offset}/${totalSize} bytes)`);
+            }
+            
+            updateStatus(`✓ Successfully sent ${totalSize} bytes via serial (${dataSize} bytes data + 4 bytes header)`, "success");
+        } finally {
+            // Always release the writer
+            writer.releaseLock();
+        }
+        
+    } catch (error) {
+        updateStatus(`✗ Error sending data: ${error.message}`, "error");
+        console.error("Serial send error:", error);
+    }
+}
+
+// Helper function to update status display with styling
+function updateStatus(message, type = "info") {
+    const statusDiv = document.getElementById("status");
+    if (statusDiv) {
+        statusDiv.textContent = message;
+        
+        // Remove all status classes
+        statusDiv.classList.remove("status-info", "status-success", "status-error", "status-warning");
+        
+        // Add appropriate class based on type
+        if (type === "success") {
+            statusDiv.classList.add("status-success");
+        } else if (type === "error") {
+            statusDiv.classList.add("status-error");
+        } else if (type === "warning") {
+            statusDiv.classList.add("status-warning");
+        } else {
+            statusDiv.classList.add("status-info");
+        }
+    }
+    console.log("Status:", message);
+}
+
+
+async function main() {
+    let textarea = document.getElementById("projectID");
+    const options = {
+      // May be called periodically with progress updates.
+      onProgress: (type, loaded, total) => {
+        // type is 'metadata', 'project', 'assets', or 'compress'
+        console.log(type, loaded / total);
+      }
+    };
+
+    const project = await SBDL.downloadProjectFromID('1238081605', options);
+    console.log(project);
+    addZipToFs(project);
+
+    const connectSerialBtn = document.getElementById("connectSerial");
+    if (connectSerialBtn) {
+        connectSerialBtn.onclick = connectSerial;
+    }
+    
+    const sendProgramDataBtn = document.getElementById("sendProgramData");
+    if (sendProgramDataBtn) {
+        sendProgramDataBtn.onclick = sendProgramDataViaSerial;
+    }
+    
+    const disconnectSerialBtn = document.getElementById("disconnectSerial");
+    if (disconnectSerialBtn) {
+        disconnectSerialBtn.onclick = disconnectSerial;
+    }
+    
+    const downloadProjectBtn = document.getElementById("downloadProject");
+    if (downloadProjectBtn) {
+        downloadProjectBtn.onclick = downloadScratchProject;
+    }
+    
+    // Allow Enter key to trigger download
+    const projectURLInput = document.getElementById("projectURLInput");
+    if (projectURLInput) {
+        projectURLInput.addEventListener("keypress", (e) => {
+            if (e.key === "Enter") {
+                downloadScratchProject();
+            }
+        });
+    }
+    
+}
+
+main();
